@@ -1,0 +1,121 @@
+/*
+Query 2: Stored procedure to summarize each patient on a row and calculate metrics 
+*/
+
+--=================================================
+--Select each patient who has received a bupe prescription and aggregate metrics,
+--such as the first order date and total days with and without coverage
+DROP TABLE IF EXISTS #moud_patient_base
+SELECT	bcp.PAT_ID
+		,MIN(bcp.MED_START_DATE) AS FIRST_ENTRY_DATE
+		,MAX(bcp.EFF_RUNOUT_DATE) AS RUNOUT_DATE
+		,DATEDIFF(DAY,MIN(bcp.MED_START_DATE), GETDATE()) AS DAYS_SINCE_FIRST_ENTRY
+		,COUNT(DISTINCT bcp.ORDER_MED_ID) AS COUNT_BUPE_SCRIPTS
+		,SUM(bcp.DAYS_WITHOUT_COVERAGE) AS TOTAL_DAYS_WITHOUT_COVG
+		,DATEDIFF(DAY,MIN(bcp.MED_START_DATE), GETDATE()) --days since first entry
+			- SUM(bcp.DAYS_WITHOUT_COVERAGE) --days without coverage
+			AS TOTAL_DAYS_WITH_COVG
+INTO	#moud_patient_base
+FROM	[dbo].[buprenorphine_class_prescription] bcp
+GROUP BY 
+	bcp.PAT_ID
+
+--=================================================
+--Pull active Methadone prescriptions
+DROP TABLE IF EXISTS #methadone
+SELECT	DISTINCT mpb.PAT_ID
+INTO	#methadone
+FROM	#moud_patient_base mpb
+		INNER JOIN dbo.prescription p ON mpb.PAT_ID = p.PAT_ID
+		LEFT JOIN dbo.provider_demographic prov ON p.MED_PRESC_PROV_ID = prov.PROV_ID
+WHERE	p.MEDICATION_NAME LIKE '%methadone%'
+		AND CONVERT(DATE, GETDATE() ) BETWEEN MED_START_DATE AND ISNULL(MED_END_DATE, '2500-01-01')
+		--Exclusions
+		AND ISNULL(p.RSN_FOR_DISCON_C,0) NOT IN (8,14) --discontinue reason = Error or Duplicate; don't exclude nulls
+		AND p.IS_PENDING_ORD_YN IS NULL -- pending orders marked with "Y"; if not pending, field is null
+
+--=================================================
+--Pull active Nalaxone prescriptions
+DROP TABLE IF EXISTS #nalaxone
+SELECT	DISTINCT mpb.PAT_ID
+		,MAX(m.MED_ORDERING_DATE) AS LAST_NALAXONE_ORDER_DATE		
+INTO	#nalaxone
+FROM	#moud_patient_base mpb
+		INNER JOIN dbo.prescription p ON mpb.PAT_ID = p.PAT_ID
+		LEFT JOIN dbo.provider_demographic prov ON p.MED_PRESC_PROV_ID = prov.PROV_ID
+WHERE	p.[MEDICATION_ID] IN ( 
+			4135, 11296, 25751, 25752, 47135, 115342, 115343 -- Naloxone
+			,136229, 143087, 143113, 147182, 149039, 149089 -- Naloxone
+			,143089, 143114 -- Narcan
+		)
+		AND CONVERT(DATE, GETDATE() ) BETWEEN MED_START_DATE AND ISNULL(MED_END_DATE, '2500-01-01')
+		--Exclusions
+		AND ISNULL(p.RSN_FOR_DISCON_C,0) NOT IN (8,14) --discontinue reason = Error or Duplicate; don't exclude nulls
+		AND p.IS_PENDING_ORD_YN IS NULL -- pending orders marked with "Y"; if not pending, field is null
+GROUP BY 
+	mpb.PAT_ID
+
+--=================================================
+--Pull care managers assigned to patient
+DROP TABLE IF EXISTS #care_managers
+SELECT	DISTINCT 
+		ppr.PAT_ID
+		,ppr.RELATIONSHIP_NAME
+		,ppr.SPECIALTY_NAME
+		,ppr.PROV_ID
+		,prov.PROV_NAME
+		,prov.PROV_TYPE
+		,ppr.EFF_DATE
+		,ROW_NUMBER() OVER (
+			PARTITION BY ppr.PAT_ID
+			ORDER BY ppr.EFF_DATE DESC
+		) AS RECENCY_RANK
+INTO	#care_managers
+FROM	dbo.patient_provider_relationship ppr
+		INNER JOIN dbo.provider_demographic prov ON ppr.PROV_ID = prov.PROV_ID
+WHERE	ppr.RELATIONSHIP_C = 1011 -- Care Manager
+		AND ISNULL(ppr.TERM_DATE,'2999-01-01') > GETDATE() --Care manager has no term date or term date is after today
+		--Exclusions
+		AND ISNULL(DELETED_YN,'U') <> 'Y' -- exclude if relationship has been deleted	
+		AND prov.PROV_TYPE NOT IN ('Dietitian','Health Educator')
+
+--=================================================
+--Create table for final data and insert into database table
+DROP TABLE IF EXISTS [dbo].[moud_summary_metrics]
+SELECT	mpb.PAT_ID
+		,pat.MRN
+		,pat.PAT_LIVING_STAT
+		,mpb.FIRST_ENTRY_DATE
+		,mpb.RUNOUT_DATE
+		,mpb.COUNT_BUPE_SCRIPTS
+		,bcp.DAYS_WITHOUT_COVERAGE AS DAYS_SINCE_LAST_RUNOUT
+		,bcp.MED_ORDER_DEPT AS LAST_ORDER_DEPT_NAME
+		,mpb.DAYS_SINCE_FIRST_ENTRY
+		,mpb.TOTAL_DAYS_WITHOUT_COVG
+		,mpb.TOTAL_DAYS_WITH_COVG
+		,CASE 
+			WHEN DAYS_SINCE_FIRST_ENTRY > 0  
+			THEN TOTAL_DAYS_WITH_COVG * 1.0 / DAYS_SINCE_FIRST_ENTRY 
+		END AS PERCENT_COVG
+		,CASE WHEN m.PAT_ID IS NOT NULL THEN 'Yes' ELSE 'No' END AS METHADONE_YN
+		,CASE WHEN n.PAT_ID IS NOT NULL THEN 'Yes' ELSE 'No' END AS NALAXONE_YN
+		,n.LAST_NALAXONE_ORDER_DATE
+		,pat.CUR_PCP_PROV_ID
+		,ISNULL(prov.PROV_NAME,'*No PCP assigned') AS PCP_PROV_NAME
+		,cm.PROV_ID AS CARE_MANAGER_PROV_ID
+		,ISNULL(cm.PROV_NAME,'*No care manager assigned') AS CARE_MANAGER_PROV_NAME
+INTO	[dbo].[moud_summary_metrics]
+FROM	#moud_patient_base mpb
+		LEFT JOIN	dbo.patient_demographic pat ON mpb.PAT_ID = pat.PAT_ID
+		LEFT JOIN	dbo.provider_demographic prov ON pat.CUR_PCP_PROV_ID = prov.PROV_ID
+		LEFT JOIN	#methadone m ON mpb.pat_ID = m.PAT_ID
+		LEFT JOIN	#nalaxone n ON mpb.pat_ID = n.PAT_ID
+		LEFT JOIN	#care_managers cm on MPB.PAT_ID = cm.PAT_ID AND RECENCY_RANK = 1 -- last CM assigned
+		LEFT JOIN	[dbo].[buprenorphine_class_prescription] bcp ON mpb.PAT_ID = bcp.PAT_ID AND bcp.RECENCY_RANK = 1
+
+--=================================================
+--DROP TABLES
+DROP TABLE #moud_patient_base
+DROP TABLE #methadone
+DROP TABLE #nalaxone
+DROP TABLE #care_managers
