@@ -1,0 +1,254 @@
+/*
+Query 1: Stored procedure to create historical list of buprenorphine type prescriptions
+and calculate runout date
+*/
+
+--If patient goes 60 days without coverage, they are considered to have exited the bupe program
+DECLARE @DAYS_WO_COVG_TO_CONSIDER_AS_PROGRAM_EXIT INT = 60
+
+--=================================================
+--Buprenorphine type medications
+--NOTE: the start/end dates work differently if it's a syringe (Sublocade), so add Y/N flag for that
+DROP TABLE IF EXISTS #moud_med_base
+SELECT	p.ORDER_MED_ID
+		,p.PAT_ID
+		,p.MEDICATION_ID
+		,p.MEDICATION_NAME
+		,CASE
+			WHEN p.MEDICATION_NAME LIKE '%syringe%' THEN 'Y' 
+			ELSE 'N'
+		END AS ADMIN_VIA_SYRINGE
+		,p.MED_START_DATE
+		,p.MED_END_DATE
+		,p.MED_DIS_DISP_QTY
+		,p.REFILLS
+		,p.ADMIN_MIN_DOSE
+		,p.ADMIN_MAX_DOSE
+		,CASE 
+			WHEN p.FREQ_ID IN (100021,200042) THEN 4
+			WHEN p.FREQ_ID IN (100019,100020,200045) THEN 3
+			WHEN p.FREQ_ID = 100018 THEN 2
+			WHEN p.FREQ_ID IN (200001,200502,200023) THEN 1
+		END as FREQ_PER_DAY_INT
+		,p.FREQ_ID
+		,p.FREQ_NAME
+INTO	#moud_med_base
+FROM	dbo.prescription p
+WHERE	(   MEDICATION_NAME LIKE '%Belbuca%' OR MEDICATION_NAME LIKE '%Bunavail%' OR MEDICATION_NAME LIKE '%Buprenex%' 
+			OR MEDICATION_NAME LIKE '%Buprenorphine%' OR MEDICATION_NAME LIKE '%Buprenorphine-naloxone%' 
+			OR MEDICATION_NAME LIKE '%Butrans%' OR MEDICATION_NAME LIKE '%Probuphine%' OR MEDICATION_NAME LIKE '%Suboxone%'
+			OR MEDICATION_NAME LIKE '%Zubsolv%' OR MEDICATION_NAME LIKE '%Sublocade%')
+		
+		--Exclusions
+		AND ISNULL(med.RSN_FOR_DISCON_C,0) NOT IN (8,14) --discontinue reason = Error or Duplicate; don't exclude nulls
+		AND med.IS_PENDING_ORD_YN IS NULL -- pending orders marked with "Y"; if not pending, field is null
+		AND med.ORDER_CLASS_C <> 3 -- "Historical Med"
+
+		----Intentionally left in query: canceled meds 
+		--sometimes providers will cancel a previous med (which was valid) 
+		--to end the prescription and add a new prescription
+		--AND (bm.ORDER_STATUS_C <> 4 OR bm.ORDER_STATUS_C IS NULL) 
+
+--=================================================
+--Medications administered at home (NOT syringe)
+--Calculate simple and complex runout days
+-----------------
+--Calculate medication quantity for order and how many taken per day
+DROP TABLE IF EXISTS #bupe_calculations
+SELECT	mmb.ORDER_MED_ID
+		,CASE 
+			WHEN mmb.MED_DIS_DISP_QTY IS NOT NULL AND mmb.REFILLS IS NOT NULL AND mmb.REFILLS <> 'PRN'
+			THEN mmb.MED_DIS_DISP_QTY * (CAST(mmb.REFILLS AS INT) + 1) --initial prescription plus refills, multipled by quantity dispensed by pharmacy
+		END AS TOTAL_MED_QUANTITY
+		,CASE
+			WHEN ISNULL(mmb.ADMIN_MAX_DOSE, mmb.ADMIN_MIN_DOSE) IS NOT NULL AND mmb.FREQ_PER_DAY_INT IS NOT NULL 
+			THEN (ISNULL(mmb.ADMIN_MAX_DOSE, mmb.ADMIN_MIN_DOSE) * mmb.FREQ_PER_DAY_INT) --dosage multiplied by how many times the med is taken each day
+		END AS USAGE_PER_DAY
+INTO	#bupe_calculations
+FROM	#moud_med_base mmb
+-----------------
+--Using medication quantity and usage per day, calculate simple and complex runout dates, depending on what data is availalbe for order
+DROP TABLE IF EXISTS #bupe_runout_calc
+SELECT	mmb.ORDER_MED_ID
+		,mmb.PAT_ID
+		,calc.TOTAL_MED_QUANTITY
+		,calc.USAGE_PER_DAY
+		,mmb.MED_START_DATE
+		,mmb.MED_END_DATE
+		,CASE
+			WHEN calc.TOTAL_MED_QUANTITY IS NOT NULL 
+			THEN DATEADD(DAY, calc.TOTAL_MED_QUANTITY, MED_START_DATE)
+		END as RUNOUT_DATE_CALC_SIMPLE
+		,CASE
+			WHEN calc.TOTAL_MED_QUANTITY IS NOT NULL AND calc.USAGE_PER_DAY IS NOT NULL 
+			THEN DATEADD(DAY, (calc.TOTAL_MED_QUANTITY / calc.USAGE_PER_DAY), mmb.MED_START_DATE)
+		END AS RUNOUT_DATE_CALC_COMPLEX
+INTO	#bupe_runout_calc
+FROM	#moud_med_base mmb
+		LEFT JOIN #bupe_calculations calc ON mmb.ORDER_MED_ID = calc.ORDER_MED_ID
+WHERE	mmb.ADMIN_VIA_SYRINGE = 'N' -- NOT FOR SYRINGE MEDS
+
+--=================================================
+--Medication administration for bupe meds given via syringe (the patient has to come in for med dose)
+--Use date given as start date and 30 days later as end date
+--If never administered, it shouldn't be on the list (possible to have an order without med administration)
+DROP TABLE IF EXISTS #sublocade_mar
+SELECT	mmb.ORDER_MED_ID
+		,ma.LINE
+		,mmb.PAT_ID
+		,ma.TAKEN_TIME AS SUBLOCADE_START_DATE
+		,CONVERT(DATE, DATEADD(DAY,30, ma.TAKEN_TIME)) AS SUBLOCADE_RUNOUT_DATE
+INTO	#sublocade_mar
+FROM	#moud_med_base mmb
+		INNER JOIN dbo.medication_administration ma ON mmb.ORDER_MED_ID = ma.ORDER_MED_ID
+WHERE	mmb.ADMIN_VIA_SYRINGE = 'Y'
+		AND ma.MAR_ACTION_C = 1 -- Given 
+
+--=================================================
+--Combine buprenorphine class medication types (taken at home / syringe)
+DROP TABLE IF EXISTS #bupe_med_dates_combo
+SELECT	ORDER_MED_ID
+		,0 AS LINE -- syringe administrations have a LINE number starting with 1 (multiple doses could be associated with one MED ORDER ID)
+		,PAT_ID
+		,TOTAL_MED_QUANTITY
+		,USAGE_PER_DAY
+		,CONVERT(DATE, MED_START_DATE) AS MED_START_DATE
+		,MED_END_DATE
+		,RUNOUT_DATE_CALC_SIMPLE
+		,RUNOUT_DATE_CALC_COMPLEX
+		,CASE --Use complex if available, then simple, then med_end_date
+			WHEN RUNOUT_DATE_CALC_COMPLEX IS NOT NULL THEN RUNOUT_DATE_CALC_COMPLEX
+			WHEN RUNOUT_DATE_CALC_SIMPLE IS NOT NULL THEN RUNOUT_DATE_CALC_SIMPLE
+			ELSE MED_END_DATE
+		END AS EFF_RUNOUT_DATE
+INTO	#bupe_med_dates_combo
+FROM	#bupe_runout_calc
+
+UNION 
+SELECT	sm.ORDER_MED_ID
+		,sm.LINE
+		,PAT_ID
+		,NULL AS TOTAL_MED_QUANTITY
+		,NULL AS USAGE_PER_DAY
+		,CONVERT(DATE, SUBLOCADE_START_DATE) AS MED_START_DATE
+		,NULL AS MED_END_DATE
+		,NULL AS RUNOUT_DATE_CALC_SIMPLE
+		,NULL AS RUNOUT_DATE_CALC_COMPLEX
+		,SUBLOCADE_RUNOUT_DATE AS EFF_RUNOUT_DATE
+FROM	#sublocade_mar sm
+
+--=================================================
+--order meds by start dates (recency and order occurrence)
+DROP TABLE IF EXISTS #bupe_med_combo_ordered_prep
+SELECT	bmdc.*
+		,ROW_NUMBER() OVER (
+			PARTITION BY bmdc.PAT_ID
+			ORDER BY bmdc.MED_START_DATE
+		) AS OCCURENCE_ORDER_RANK
+INTO	#bupe_med_combo_ordered_prep
+FROM	#bupe_med_dates_combo bmdc
+---
+--sometimes there are 2 orders on same day; in this instance, we want to make sure the recency rank is the exact inverse 
+--of occurrence order rank (since it's randomized if the start date is the same)
+DROP TABLE IF EXISTS #bupe_med_combo_ordered
+SELECT	bmcop.*
+		,ROW_NUMBER() OVER (
+			PARTITION BY bmcop.PAT_ID
+			ORDER BY bmcop.MED_START_DATE DESC, bmcop.OCCURENCE_ORDER_RANK DESC
+		) AS RECENCY_RANK
+INTO	#bupe_med_combo_ordered
+FROM	#bupe_med_combo_ordered_prep bmcop
+
+--=================================================
+--Calculate effective runout date and days without coverage
+DROP TABLE IF EXISTS #days_wo_coverage
+SELECT	
+		bm.ORDER_MED_ID
+		,bm.LINE
+		,DATEDIFF( DAY, 
+			bm.EFF_RUNOUT_DATE, ISNULL(bm_next.MED_START_DATE, GETDATE()) 
+		) AS DAYS_WITHOUT_COVERAGE
+		,bm_next.ORDER_MED_ID AS NEXT_BUP_ORDER_MED_ID
+		,bm_next.LINE AS NEXT_BUP_LINE
+		,bm_next.MED_START_DATE AS NEXT_MED_START_DATE
+INTO	#days_wo_coverage
+FROM	#bupe_med_combo_ordered bm
+		LEFT JOIN #bupe_med_combo_ordered bm_next ON 
+			bm.PAT_ID = bm_next.PAT_ID AND -- join table to itself, look for the med order with next rank
+			(bm.OCCURENCE_ORDER_RANK + 1) = bm_next.OCCURENCE_ORDER_RANK
+
+--=================================================
+--Create table for final data and insert into database table
+DROP TABLE IF EXISTS [dbo].[buprenorphine_class_prescription]
+SELECT	bmco.ORDER_MED_ID
+		,bmco.LINE
+		,bmco.PAT_ID
+		,p.PAT_ENC_CSN_ID
+		,p.MEDICATION_NAME
+		,bmco.RECENCY_RANK
+		,bmco.OCCURENCE_ORDER_RANK
+		,CASE 
+			WHEN OCCURENCE_ORDER_RANK = 1 THEN 'Y' 
+			WHEN reentries.NEXT_BUP_ORDER_MED_ID IS NOT NULL THEN 'Y'
+			ELSE 'N'
+		END AS COUNTS_AS_ENTRY_YN
+		,CASE 
+			WHEN DAYS_WITHOUT_COVERAGE >= @DAYS_WO_COVG_TO_CONSIDER_AS_PROGRAM_EXIT THEN 'Y' 
+			ELSE 'N'
+		END AS COUNTS_AS_EXIT_YN
+		,CASE 
+			WHEN dwc.DAYS_WITHOUT_COVERAGE <= 0 THEN 0
+			ELSE dwc.DAYS_WITHOUT_COVERAGE
+		END AS DAYS_WITHOUT_COVERAGE
+		,bmco.MED_START_DATE
+		,bmco.EFF_RUNOUT_DATE
+		,bmco.MED_END_DATE
+		,bmco.RUNOUT_DATE_CALC_SIMPLE
+		,bmco.RUNOUT_DATE_CALC_COMPLEX
+		,bmco.TOTAL_MED_QUANTITY
+		,bmco.USAGE_PER_DAY
+		,mmb.MED_DIS_DISP_QTY
+		,mmb.REFILLS
+		,mmb.ADMIN_MAX_DOSE
+		,mmb.ADMIN_MIN_DOSE
+		,mmb.FREQ_PER_DAY_INT
+		,p.MED_PRESC_PROV_ID
+		,prov.PROV_NAME AS MED_PRESC_PROV_NAME
+		,dep.DEPARTMENT_DISPLAY_LABEL AS MED_ORDER_DEPT
+		,pat.MRN
+		,ISNULL(pat.PAT_FIRST_NAME_PREFERRED,pat.PAT_FIRST_NAME) AS PREFERRED_FIRST_NAME
+		,pat.PAT_LAST_NAME
+		,pat.BIRTH_DATE AS DOB
+		,pat.PAT_LIVING_STAT
+		,pcp.PROV_NAME AS PCP_PROV_NAME
+		,dwc.NEXT_BUP_ORDER_MED_ID
+		,dwc.NEXT_BUP_LINE
+INTO	[dbo].[buprenorphine_class_prescription]
+FROM	#bupe_med_combo_ordered bmco 
+		LEFT JOIN #moud_med_base mmb ON bmco.ORDER_MED_ID = mmb.ORDER_MED_ID
+		LEFT JOIN dbo.prescription p ON bmco.ORDER_MED_ID = p.ORDER_MED_ID
+		INNER JOIN dbo.patient_demographic pat ON med.PAT_ID = pat.PAT_ID
+		INNER JOIN dbo.patient_encounter enc ON p.PAT_ENC_CSN_ID = enc.PAT_ENC_CSN_ID
+		INNER JOIN dbo.provider_demographic prov ON p.MED_PRESC_PROV_ID = prov.PROV_ID
+		LEFT JOIN  dbo.provider_demographic pcp ON pat.CUR_PCP_PROV_ID = pcp.PROV_ID
+		INNER JOIN dbo.encounter_department dep ON enc.DEPARTMENT_ID = dep.DEPARTMENT_ID		
+		LEFT JOIN #days_wo_coverage dwc ON bmco.ORDER_MED_ID = dwc.ORDER_MED_ID  
+			AND bmco.LINE = dwc.LINE
+		LEFT JOIN ( -- if days wo coverage is 60 or more, pull the next_bup_order_med_id
+			SELECT	DISTINCT NEXT_BUP_ORDER_MED_ID, NEXT_BUP_LINE
+			FROM	#days_wo_coverage dwc 
+			WHERE	dwc.DAYS_WITHOUT_COVERAGE >= @DAYS_WO_COVG_TO_CONSIDER_AS_PROGRAM_EXIT
+		) reentries ON bmco.ORDER_MED_ID = reentries.NEXT_BUP_ORDER_MED_ID
+			AND bmco.LINE = reentries.NEXT_BUP_LINE
+ORDER BY med.PAT_ID, OCCURENCE_ORDER_RANK
+
+--=================================================
+--DROP TABLES 
+DROP TABLE #moud_med_base
+DROP TABLE #bupe_calculations
+DROP TABLE #bupe_runout_calc
+DROP TABLE #sublocade_mar
+DROP TABLE #bupe_med_dates_combo
+DROP TABLE #bupe_med_combo_ordered_prep
+DROP TABLE #bupe_med_combo_ordered
+DROP TABLE #days_wo_coverage
